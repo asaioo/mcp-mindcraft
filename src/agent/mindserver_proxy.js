@@ -2,6 +2,7 @@ import { io } from 'socket.io-client';
 import convoManager from './conversation.js';
 import { setSettings } from './settings.js';
 import { getFullState } from './library/full_state.js';
+import { getCommandDocs } from './commands/index.js';
 
 // agent's individual connection to the mindserver
 // always connect to localhost
@@ -76,6 +77,25 @@ class MindServerProxy {
             } catch (error) {
                 console.error('Error getting full state:', error);
                 callback(null);
+            }
+        });
+
+        // MCP: send text directly to Minecraft chat without the AI pipeline
+        this.socket.on('direct-chat', (message) => {
+            try {
+                this.agent.openChat(message);
+            } catch (error) {
+                console.error('Error in direct-chat:', error);
+            }
+        });
+
+        // MCP: return available command documentation to the caller
+        this.socket.on('get-commands', (callback) => {
+            try {
+                callback(getCommandDocs(this.agent));
+            } catch (error) {
+                console.error('Error in get-commands:', error);
+                callback('');
             }
         });
 

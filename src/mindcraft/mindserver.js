@@ -208,6 +208,30 @@ export function createMindServer(host_public = false, port = 8080) {
 			}
 		});
 
+        // MCP: send text directly to bot.chat without going through the AI pipeline
+        socket.on('direct-chat', (agentName, message) => {
+            const conn = agent_connections[agentName];
+            if (!conn || !conn.in_game) {
+                console.warn(`direct-chat: agent ${agentName} not in game`);
+                return;
+            }
+            conn.socket.emit('direct-chat', message);
+        });
+
+        // MCP: retrieve available command docs from the agent
+        socket.on('get-commands', (agentName, callback) => {
+            const conn = agent_connections[agentName];
+            if (!conn || !conn.in_game) {
+                callback({ error: `Agent ${agentName} not in game` });
+                return;
+            }
+            const t = setTimeout(() => callback({ error: 'get-commands timed out' }), 5000);
+            conn.socket.emit('get-commands', (docs) => {
+                clearTimeout(t);
+                callback({ docs });
+            });
+        });
+
         socket.on('bot-output', (agentName, message) => {
             io.emit('bot-output', agentName, message);
         });
