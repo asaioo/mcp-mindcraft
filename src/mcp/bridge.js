@@ -27,7 +27,16 @@ export class MindServerBridge {
         this.outputBuffer = {};
         /** @type {Record<string, object|null>} */
         this.latestStates = {};
+        /** @type {Record<string, Array<{sender:string, message:string, timestamp:number}>>} */
+        this.chatBuffer = {};
+        /**
+         * Chat rules: when an incoming chat event matches the pattern the command is auto-dispatched.
+         * @type {Record<string, Record<string, {pattern:RegExp, command:string}>>}
+         */
+        this.chatRules = {};
         this._listeningToAgents = false;
+        /** @type {Record<string, Array<(events: Array) => void>>} */
+        this._chatWaiters = {};
     }
 
     async connect() {
@@ -39,28 +48,15 @@ export class MindServerBridge {
             reconnectionAttempts: Infinity,
         });
 
-        await new Promise((resolve, reject) => {
-            const timeout = setTimeout(() => {
-                reject(new Error(`Timed out connecting to MindServer on port ${this.port}`));
-            }, 10_000);
-
-            this.socket.once('connect', () => {
-                clearTimeout(timeout);
-                resolve();
-            });
-            this.socket.once('connect_error', (err) => {
-                clearTimeout(timeout);
-                reject(new Error(`Cannot connect to MindServer: ${err.message}`));
-            });
-        });
-
-        this.connected = true;
-
+        // Attach all persistent handlers BEFORE awaiting the connection promise
+        // so they survive a failed initial connect and fire correctly on later reconnects.
         this.socket.on('disconnect', (reason) => {
             this.connected = false;
             process.stderr.write(`[MCP Bridge] Disconnected from MindServer: ${reason}\n`);
         });
 
+        // socket.io v4: 'connect' fires on every (re)connect, 'reconnect' fires after a disconnect.
+        // Handle both so we resume properly whether starting in degraded mode or after a drop.
         this.socket.on('reconnect', () => {
             this.connected = true;
             process.stderr.write('[MCP Bridge] Reconnected to MindServer.\n');
@@ -84,6 +80,52 @@ export class MindServerBridge {
             }
         });
 
+        this.socket.on('chat-event', (agentName, event) => {
+            const buf = this.chatBuffer[agentName] ?? [];
+            buf.push(event);
+            if (buf.length > 200) buf.shift();
+            this.chatBuffer[agentName] = buf;
+
+            // Notify any waitForChat waiters
+            const waiters = this._chatWaiters[agentName];
+            if (waiters && waiters.length > 0) {
+                for (const resolve of waiters) {
+                    resolve([event]);
+                }
+                this._chatWaiters[agentName] = [];
+            }
+
+            // Evaluate registered chat rules and auto-dispatch matching commands.
+            const rules = this.chatRules[agentName];
+            if (rules) {
+                for (const rule of Object.values(rules)) {
+                    if (rule.pattern.test(event.message)) {
+                        const cmd = rule.command
+                            .replace(/\{sender\}/g, event.sender)
+                            .replace(/\{message\}/g, event.message);
+                        process.stderr.write(`[MCP Bridge] Chat rule matched: ${cmd}\n`);
+                        this.sendCommand(agentName, cmd);
+                    }
+                }
+            }
+        });
+
+        await new Promise((resolve, reject) => {
+            const timeout = setTimeout(() => {
+                reject(new Error(`Timed out connecting to MindServer on port ${this.port}`));
+            }, 10_000);
+
+            this.socket.once('connect', () => {
+                clearTimeout(timeout);
+                resolve();
+            });
+            this.socket.once('connect_error', (err) => {
+                clearTimeout(timeout);
+                reject(new Error(`Cannot connect to MindServer: ${err.message}`));
+            });
+        });
+
+        this.connected = true;
         this._startListening();
     }
 
@@ -135,7 +177,7 @@ export class MindServerBridge {
     // ------------------------------------------------------------------ //
 
     /**
-     * Send a Mindcraft command to Andy (e.g. `!goToPlayer("Player1", 3)`).
+     * Send a Mindcraft command to the named agent (e.g. `!goToPlayer("Player1", 3)`).
      * Uses the existing send-message path. Because the message contains a
      * recognised `!commandName(...)` pattern, agent.handleMessage() executes
      * it DIRECTLY — no AI model call is made.
@@ -144,12 +186,12 @@ export class MindServerBridge {
      * @param {string} command  - full command string, e.g. `!collectBlocks("oak_log", 5)`
      */
     sendCommand(agentName, command) {
-        this.socket.emit('send-message', agentName, { from: 'claude', message: command });
+        this.socket.emit('send-message', agentName, { from: 'mcp', message: command });
     }
 
     /**
-     * Make Andy say text in Minecraft chat without invoking his AI model.
-     * Routes through the new direct-chat socket event.
+     * Make the named agent say text in Minecraft chat without invoking its AI model.
+     * Routes through the direct-chat socket event.
      *
      * @param {string} agentName
      * @param {string} message
@@ -218,7 +260,74 @@ export class MindServerBridge {
         return buf;
     }
 
+    getChatBuffer(agentName, clear = false) {
+        const buf = this.chatBuffer[agentName] ?? [];
+        if (clear) this.chatBuffer[agentName] = [];
+        return buf;
+    }
+
+    // ------------------------------------------------------------------ //
+    // Chat rules
+    // ------------------------------------------------------------------ //
+
+    /**
+     * Register a chat rule. When an incoming chat message matches `patternSource`
+     * (a JS regex string), `command` is dispatched to the agent.
+     * `{sender}` and `{message}` in the command string are replaced at match time.
+     */
+    addChatRule(agentName, id, patternSource, command) {
+        if (!this.chatRules[agentName]) this.chatRules[agentName] = {};
+        this.chatRules[agentName][id] = { pattern: new RegExp(patternSource, 'i'), command };
+    }
+
+    removeChatRule(agentName, id) {
+        if (this.chatRules[agentName]) {
+            delete this.chatRules[agentName][id];
+        }
+    }
+
+    listChatRules(agentName) {
+        const rules = this.chatRules[agentName] ?? {};
+        return Object.entries(rules).map(([id, r]) => ({
+            id,
+            pattern: r.pattern.source,
+            command: r.command,
+        }));
+    }
+
+    clearChatRules(agentName) {
+        this.chatRules[agentName] = {};
+    }
+
+    /**
+     * Long-poll for new chat messages. Resolves when a message arrives or timeout.
+     * @param {string} agentName
+     * @param {number} timeoutMs
+     * @returns {Promise<Array<{sender:string, message:string, timestamp:number}>>}
+     */
+    waitForChat(agentName, timeoutMs = 30000) {
+        return new Promise((resolve) => {
+            const timer = setTimeout(() => {
+                // Remove this waiter on timeout
+                const waiters = this._chatWaiters[agentName];
+                if (waiters) {
+                    const idx = waiters.indexOf(resolveWrapper);
+                    if (idx !== -1) waiters.splice(idx, 1);
+                }
+                resolve([]);
+            }, timeoutMs);
+
+            const resolveWrapper = (events) => {
+                clearTimeout(timer);
+                resolve(events);
+            };
+
+            if (!this._chatWaiters[agentName]) this._chatWaiters[agentName] = [];
+            this._chatWaiters[agentName].push(resolveWrapper);
+        });
+    }
+
     isConnected() {
-        return this.connected;
+        return this.connected || (this.socket?.connected ?? false);
     }
 }
