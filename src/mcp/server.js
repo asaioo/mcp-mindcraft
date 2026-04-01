@@ -25,7 +25,7 @@ import {
 } from '@modelcontextprotocol/sdk/types.js';
 
 import { MindServerBridge } from './bridge.js';
-import { getToolDefinitions, handleToolCall } from './tools.js';
+import { getToolDefinitions, handleToolCall } from './tools/index.js';
 import { getResourceDefinitions, getResourceTemplates, handleResourceRead } from './resources.js';
 
 const SERVER_NAME = 'mindcraft-mcp';
